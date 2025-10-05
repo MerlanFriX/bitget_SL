@@ -5,7 +5,7 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.append(str(ROOT_DIR))
 
-sys.path.append("./Live-Tools-V2")
+sys.path.append("./bitget_SL")
 
 import asyncio
 from utilities.bitget_perp import PerpBitget
@@ -98,7 +98,7 @@ PARAMS = {
     },
 }
 
-RELATIVE_PATH = "./Live-Tools-V2/strategies/breakout"
+RELATIVE_PATH = "./strategies/breakout"
 
 POSITIONS_FILE = Path(RELATIVE_PATH) / f"positions_{ACCOUNT_NAME}.json"
 

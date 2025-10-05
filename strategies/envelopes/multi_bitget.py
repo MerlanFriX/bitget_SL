@@ -1,7 +1,10 @@
 import datetime
 import sys
+from pathlib import Path
 
-sys.path.append("./Live-Tools-V2")
+ROOT_DIR = Path(__file__).resolve().parents[2]
+sys.path.append(str(ROOT_DIR))
+sys.path.append("./bitget_SL")
 
 import asyncio
 from utilities.bitget_perp import PerpBitget

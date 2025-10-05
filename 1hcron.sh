@@ -1,1 +1,1 @@
-source Live-Tools-V2/.venv/bin/activate
+source bitget_SL/.venv/bin/activate
