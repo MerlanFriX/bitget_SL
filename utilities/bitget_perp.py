@@ -162,6 +162,30 @@ class PerpBitget:
             free=resp["USDT"]["free"],
             used=resp["USDT"]["used"],
         )
+    
+    async def calculate_position_size(self, pair: str, balance_pct: float, leverage: float = 1.0) -> float:
+        """
+        Calculates position size in contract units based on available USDT balance and pair price.
+        balance_pct = 0.1 means use 10% of available USDT.
+        """
+        balance = await self.get_balance()
+        free_usdt = balance.free
+
+        # fetch latest price
+        ticker = await self._session.fetch_ticker(self.ext_pair_to_pair(pair))
+        last_price = ticker["last"]
+
+        # total USDT to use
+        position_usdt = free_usdt * balance_pct
+
+        # convert USDT value to coin quantity
+        qty = (position_usdt * leverage) / last_price
+
+        # apply precision rules
+        qty = float(self.amount_to_precision(pair, qty))
+
+        return qty
+
 
     async def set_margin_mode_and_leverage(self, pair, margin_mode, leverage):
         if margin_mode not in ["crossed", "isolated"]:
@@ -313,6 +337,18 @@ class PerpBitget:
             pair = self.ext_pair_to_pair(pair)
             trade_side = "Open" if reduce is False else "Close"
             margin_mode = "cross" if margin_mode == "crossed" else "isolated"
+
+            params = {
+                "reduceOnly": reduce,
+                "tradeSide": trade_side,
+                "marginMode": margin_mode,
+                "hedged": hedge_mode,
+                "triggerType": "mark_price",          # ✅ required
+                "executeOrderType": "market",         # ✅ required for SL
+                "productType": "USDT-FUTURES",        # ✅ required
+                "marginCoin": "USDT",                 # ✅ required
+            }
+
             trigger_order = await self._session.create_trigger_order(
                 symbol=pair,
                 type=type,
@@ -320,21 +356,21 @@ class PerpBitget:
                 amount=size,
                 price=price,
                 triggerPrice=trigger_price,
-                params={
-                    "reduceOnly": reduce,
-                    "tradeSide": trade_side,
-                    "marginMode": margin_mode,
-                    "hedged": hedge_mode,
-                },
+                params=params,
             )
+
             resp = Info(success=True, message="Trigger Order set up")
             return resp
+
         except Exception as e:
-            print(f"Error {type} {side} {size} {pair} - Trigger {trigger_price} - Price {price} - Error => {str(e)}")
+            print(
+                f"❌ Error {type} {side} {size} {pair} - Trigger {trigger_price} - Price {price} - Error => {str(e)}"
+            )
             if error:
                 raise e
             else:
                 return None
+
 
     async def get_open_orders(self, pair) -> List[Order]:
         pair = self.ext_pair_to_pair(pair)
@@ -416,3 +452,8 @@ class PerpBitget:
             return Info(success=True, message=f"{len(resp)} Trigger Orders cancelled")
         except Exception as e:
             return Info(success=False, message="Error or no orders to cancel")
+
+
+
+
+

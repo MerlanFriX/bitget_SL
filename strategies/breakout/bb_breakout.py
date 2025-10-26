@@ -23,6 +23,7 @@ MARGIN_MODE = "isolated" # isolated or cross
 LEVERAGE = 1.5
 ACCOUNT_NAME = "bitget_main"
 SIDE = ["long","short"]
+HEDGE_MODE = True  # True to allow both long and short at the same time on the same pair
 DISCORD_WEBHOOK = ""
 TIMEFRAME = "1h"
 PARAMS = {
@@ -125,6 +126,7 @@ if sys.platform == "win32":
 async def main():
     account = ACCOUNTS[ACCOUNT_NAME]
     margin_mode = MARGIN_MODE
+    hedge_mode = HEDGE_MODE
     leverage = LEVERAGE
     exchange_leverage = math.ceil(leverage)
     params = PARAMS
@@ -163,7 +165,7 @@ async def main():
                 )
                 del key_params[pair]
                 pair_list.remove(pair)
-                
+        
         print(f"Getting data and indicators on {len(pair_list)} pairs...")
         tasks = []
         keys = []
@@ -209,14 +211,13 @@ async def main():
 
             df.dropna(inplace=True)
             df_list[key_param] = df
-        
-        # --- Debug print to see last row and breakout signals ---
+            
+         # --- Debug print to see last row and breakout signals ---
         for key, df in df_list.items():
-            print(f"Pair {key}, last close: {df.iloc[-1]['close']}, breakout_up: {df.iloc[-1].get('breakout_up')}, breakout_down: {df.iloc[-1].get('breakout_down')}")
-        
+            print(f"Pair {key}, last close: {df.iloc[-2]['close']}, breakout_up: {df.iloc[-2].get('breakout_up')}, breakout_down: {df.iloc[-2].get('breakout_down')}")       
         usdt_balance = await exchange.get_balance()
         usdt_balance = usdt_balance.total
-        dl.log(f"Balance: {round(usdt_balance, 2)} USDT")
+        dl.log(f"Balance: {round(usdt_balance, 2)} USDT")   
 
         # Keep track of which pairs are already configured
         configured_pairs = []
@@ -274,137 +275,129 @@ async def main():
                 print("❌ Unexpected error while setting leverage/margin:", e)
 
         # --- Close positions ---
-        key_positions_copy = copy.deepcopy(key_positions)
-        print("key_positions:", key_positions)
-        print("positions returned:", positions)
-        print("df_list keys:", df_list.keys())
-        if not key_positions_copy:
-            print("No saved positions to process, skipping close logic.")
+        for key_position in list(key_positions.keys()):
+            position_object = key_positions[key_position]
+            param_object = key_params.get(key_position)
+            if param_object is None:
+                # unknown params — remove stale
+                del key_positions[key_position]
+                save_positions(key_positions)
+                continue
 
-        for key_position in key_positions_copy:
-            position_object = key_positions_copy[key_position]
-            param_object = key_params[key_position]
             df = df_list.get(key_position)
             if df is None or len(df) < 2:
-                print(f"Not enough data for {param_object['pair']}, skipping...")
-                continue
-            exchange_positions = [p for p in positions if (p.pair == param_object["pair"] and p.side == position_object["side"])]
-            if len(exchange_positions) == 0:
-                print(f"No position found for {param_object['pair']}, skipping...")
-                continue
-            exchange_position_size = sum([p.size for p in exchange_positions])
-            if len(df) < 2:
                 dl.log(f"Not enough data for {param_object['pair']}, skipping...")
                 continue
-            
-            row = df.iloc[-1]  # you can also consider using the last row df.iloc[-1]
-            current_price = row["close"]
+
+            # find positions on exchange for this pair (case-insensitive side match later)
+            exchange_positions = [p for p in positions if p.pair == param_object["pair"]]
+
+            if not exchange_positions:
+                dl.log(f"⚠️ No active position for {param_object['pair']} on exchange. Removing local record.")
+                del key_positions[key_position]
+                save_positions(key_positions)
+                continue
+
+            exchange_pos = exchange_positions[0]
+
+            # normalize side compare (case-insensitive)
+            if exchange_pos.side.lower() != position_object["side"].lower():
+                dl.log(f"⚠️ Side mismatch for {param_object['pair']}: local={position_object['side']} / exchange={exchange_pos.side}. Removing local record.")
+                del key_positions[key_position]
+                save_positions(key_positions)
+                continue
+
+            # proceed to decide closing (use entry/atr logic you already have)
+            exchange_position_size = exchange_pos.size
+            row = df.iloc[-2]
             atr_value = row.get("atr")
             if not np.isfinite(atr_value):
                 dl.log(f"Invalid ATR for {param_object['pair']}, skipping...")
                 continue
-            entry_price = position_object.get("entry_price")
 
-            if not entry_price or atr_value is None:
-                print(f"Missing entry price or ATR for {param_object['pair']}, skipping stop loss check.")
+            entry_price = position_object.get("entry_price")
+            if not entry_price:
+                dl.log(f"Missing entry price for {param_object['pair']}, removing local record.")
+                del key_positions[key_position]
+                save_positions(key_positions)
                 continue
 
-            # --- ATR STOP LOSS CHECK ---
-            stop_loss_hit = False
-            if position_object["side"] == "long":
-                stop_loss_price = entry_price - atr_value
-                stop_loss_hit = current_price <= stop_loss_price
-            elif position_object["side"] == "short":
-                stop_loss_price = entry_price + atr_value
-                stop_loss_hit = current_price >= stop_loss_price
-
-            # --- BREAKOUT LOGIC (if stop loss not triggered) ---
-            if stop_loss_hit:
+            # LONG close condition
+            if position_object["side"].lower() == "long" and row.get("breakout_down", False):
                 close_size = min(position_object["size"], exchange_position_size)
                 try:
                     order = await exchange.place_order(
                         pair=param_object["pair"],
-                        side="sell" if position_object["side"] == "long" else "buy",
+                        side="sell",
                         price=None,
                         size=close_size,
                         type="market",
                         reduce=True,
                         margin_mode=margin_mode,
-                        leverage=math.ceil(leverage),
-                        error=True,
+                        hedge_mode=hedge_mode,
+                        error=False,
                     )
-                    if order is not None:
+                    if order:
+                        dl.log(f"✅ Closed {key_position} {close_size} {param_object['pair']} long due to breakout_down")
+                    else:
+                        dl.log(f"⚠️ Close attempt returned no order for {key_position}")
+                except Exception as e:
+                    await dl.send_now(f"❌ Error closing {key_position} ({param_object['pair']}): {e}", level="ERROR")
+                finally:
+                    # remove local record to avoid 'stuck' positions
+                    if key_position in key_positions:
                         del key_positions[key_position]
                         save_positions(key_positions)
-                        dl.log(f"🛑 {key_position} STOP LOSS hit: Closed {order.size} {param_object['pair']} {position_object['side']} at {current_price} (ATR SL)")
-                    continue  # skip breakout check if SL was hit
+                continue
+
+            # SHORT close condition
+            if position_object["side"].lower() == "short" and row.get("breakout_up", False):
+                close_size = min(position_object["size"], exchange_position_size)
+                try:
+                    order = await exchange.place_order(
+                        pair=param_object["pair"],
+                        side="buy",
+                        price=None,
+                        size=close_size,
+                        type="market",
+                        reduce=True,
+                        margin_mode=margin_mode,
+                        hedge_mode=hedge_mode,
+                        error=False,
+                    )
+                    if order:
+                        dl.log(f"✅ Closed {key_position} {close_size} {param_object['pair']} short due to breakout_up")
+                    else:
+                        dl.log(f"⚠️ Close attempt returned no order for {key_position}")
                 except Exception as e:
-                    await dl.send_now(f"❌ {key_position} Error closing {param_object['pair']} due to ATR stop loss: {e}", level="ERROR")
-                    continue
+                    await dl.send_now(f"❌ Error closing {key_position} ({param_object['pair']}): {e}", level="ERROR")
+                finally:
+                    if key_position in key_positions:
+                        del key_positions[key_position]
+                        save_positions(key_positions)
+                continue
 
-            if position_object["side"] == "long":
-                # Close condition for long: breakout_down signal True
-                if row.get("breakout_down", False):
-                    close_size = min(position_object["size"], exchange_position_size)
-                    try:
-                        order = await exchange.place_order(
-                            pair=param_object["pair"],
-                            side="sell",
-                            price=None,
-                            size=close_size,
-                            type="market",
-                            reduce=True,
-                            margin_mode=margin_mode,
-                            leverage=math.ceil(leverage),
-                            error=True,
-                        )
-                        if order is not None:
-                            del key_positions[key_position]
-                            save_positions(key_positions)
-                            dl.log(f"{key_position} Closed {order.size} {param_object['pair']} long due to breakout_down")
-                    except Exception as e:
-                        await dl.send_now(f"{key_position} Error closing {param_object['pair']} long: {e}", level="ERROR")
-                        continue
-
-            elif position_object["side"] == "short":
-                # Close condition for short: breakout_up signal True
-                if row.get("breakout_up", False):
-                    close_size = min(position_object["size"], exchange_position_size)
-                    try:
-                        order = await exchange.place_order(
-                            pair=param_object["pair"],
-                            side="buy",
-                            price=None,
-                            size=close_size,
-                            type="market",
-                            reduce=True,
-                            margin_mode=margin_mode,
-                            leverage=math.ceil(leverage),
-                            error=True,
-                        )
-                        if order is not None:
-                            del key_positions[key_position]
-                            save_positions(key_positions)
-                            dl.log(f"{key_position} Closed {order.size} {param_object['pair']} short due to breakout_up")
-                    except Exception as e:
-                        await dl.send_now(f"{key_position} Error closing {param_object['pair']} short: {e}", level="ERROR")
-                        continue
             
         # --- Open new positions ---
         for key, df in df_list.items():
             if len(df) < 2:
                 continue
 
-            row = df.iloc[-1]
+            row = df.iloc[-2]
             param = key_params[key]
 
             # Skip if already in a position
             if key in key_positions:
                 continue
 
-            entry_size = param["size"]
+            balance_pct = param.get("size", 0.1)  # 0.1 = 10% of available balance
+            entry_size = await exchange.calculate_position_size(
+                pair=param["pair"],
+                balance_pct=balance_pct,
+                leverage=leverage,
+                )
 
-            # LONG ENTRY
+            # ----- LONG ENTRY
             if row.get("breakout_up", False) and row.get("vol_spike", False):
                 try:
                     order = await exchange.place_order(
@@ -414,23 +407,94 @@ async def main():
                         size=entry_size,
                         type="market",
                         margin_mode=margin_mode,
-                        leverage=math.ceil(leverage),
-                        error=True,
+                        hedge_mode=hedge_mode,
+                        error=False,   # return None on failure, handle gracefully
                     )
-                    if order is not None:
-                        key_positions[key] = {
-                            "pair": param["pair"],
-                            "side": "long",
-                            "size": order.size,
-                            "entry_price": row["close"],
-                        }
-                        save_positions(key_positions)
-                        dl.log(f"✅ OPENED LONG {order.size} {param['pair']} at {row['close']}")
+
+                    print("order returned:", order)
+                    if not order:
+                        dl.log(f"⚠️ Order creation failed for {param['pair']}, skipping SL.")
+                        continue
+
+                    # try to obtain an order ID and then fetch order details (fill price/filled size)
+                    order_id = None
+                    if isinstance(order, dict):
+                        order_id = order.get("id") or order.get("orderId")
+                    else:
+                        order_id = getattr(order, "id", None)
+
+                    order_info = None
+                    if order_id:
+                        order_info = await exchange.get_order_by_id(order_id, param["pair"])
+
+                    # derive executed_price and executed_size (fallbacks)
+                    executed_price = None
+                    executed_size = None
+                    if order_info:
+                        executed_price = getattr(order_info, "average", None) \
+                     or getattr(order_info, "price", None) \
+                     or getattr(order_info, "filledPrice", None)
+                        executed_size = getattr(order_info, "filled", None) \
+                     or getattr(order_info, "amount", None) \
+                     or (order.filled if hasattr(order, "filled") else None)
+                     
+                    else:
+                        # best-effort fallback
+                        if isinstance(order, dict):
+                            executed_price = order.get("price") or row["close"]
+                            executed_size = order.get("filled") or order.get("amount") or entry_size
+
+
+                    if executed_size is None:
+                        executed_size = entry_size
+
+                    # Save local position using executed_price/size
+                    key_positions[key] = {
+                        "pair": param["pair"],
+                        "side": "long",
+                        "size": executed_size,
+                        "entry_price": executed_price or row["close"],
+                    }
+                    save_positions(key_positions)
+                    dl.log(f"✅ OPENED LONG {executed_size} {param['pair']} at {executed_price or row['close']}")
+
+                    # 2️⃣ Place ATR-based stop-loss on Bitget
+                    atr_value = row["atr"] if "atr" in row else None
+                    if np.isfinite(atr_value):
+                        stop_loss_price = (executed_price or row["close"]) - atr_value
+                        trigger_price = exchange.price_to_precision(param["pair"], stop_loss_price)
+
+                        stop_side = "sell"
+
+                        sl_order = await exchange.place_trigger_order(
+                            pair=param["pair"],
+                            side=stop_side,
+                            trigger_price=trigger_price,
+                            price=None,
+                            size=order.size,
+                            type="market",
+                            reduce=True,
+                            margin_mode=margin_mode,
+                            hedge_mode=hedge_mode,
+                            error=True,
+                        )
+
+                        if sl_order:
+                            dl.log(f"🛑 Stop-loss placed for {param['pair']} at {stop_loss_price}")
+
+
+                        # verify triggers via helper
+                        open_triggers = await exchange.get_open_trigger_orders(param["pair"])
+                        if open_triggers:
+                            dl.log(f"🛑 Stop-loss placed for {param['pair']} at {trigger_price} (found {len(open_triggers)} trigger(s))")
+                        else:
+                            dl.log(f"⚠️ Stop-loss NOT visible for {param['pair']} after placement")
                 except Exception as e:
                     await dl.send_now(f"❌ Error opening long on {param['pair']}: {e}", level="ERROR")
 
-            # SHORT ENTRY
-            elif row.get("breakout_down", False) and row.get("vol_spike", False):
+
+            # ----- SHORT ENTRY
+            if row.get("breakout_down", False) and row.get("vol_spike", False):
                 try:
                     order = await exchange.place_order(
                         pair=param["pair"],
@@ -439,20 +503,90 @@ async def main():
                         size=entry_size,
                         type="market",
                         margin_mode=margin_mode,
-                        leverage=math.ceil(leverage),
-                        error=True,
+                        hedge_mode=hedge_mode,
+                        error=False,   # return None on failure, handle gracefully
                     )
-                    if order is not None:
-                        key_positions[key] = {
-                            "pair": param["pair"],
-                            "side": "short",
-                            "size": order.size,
-                            "entry_price": row["close"],
-                        }
-                        save_positions(key_positions)
-                        dl.log(f"✅ OPENED SHORT {order.size} {param['pair']} at {row['close']}")
+
+                    print("order returned:", order)
+                    if not order:
+                        dl.log(f"⚠️ Order creation failed for {param['pair']}, skipping SL.")
+                        continue
+
+                    # try to obtain an order ID and then fetch order details (fill price/filled size)
+                    order_id = None
+                    if isinstance(order, dict):
+                        order_id = order.get("id") or order.get("orderId")
+                    else:
+                        order_id = getattr(order, "id", None)
+
+                    order_info = None
+                    if order_id:
+                        order_info = await exchange.get_order_by_id(order_id, param["pair"])
+
+                    # derive executed_price and executed_size (fallbacks)
+                    executed_price = None
+                    executed_size = None
+                    if order_info:
+                        executed_price = getattr(order_info, "average", None) \
+                     or getattr(order_info, "price", None) \
+                     or getattr(order_info, "filledPrice", None)
+                        executed_size = getattr(order_info, "filled", None) \
+                     or getattr(order_info, "amount", None) \
+                     or (order.filled if hasattr(order, "filled") else None)
+                     
+                    else:
+                        # best-effort fallback
+                        if isinstance(order, dict):
+                            executed_price = order.get("price") or row["close"]
+                            executed_size = order.get("filled") or order.get("amount") or entry_size
+
+                    if executed_size is None:
+                        executed_size = entry_size
+
+                    # Save local position using executed_price/size
+                    key_positions[key] = {
+                        "pair": param["pair"],
+                        "side": "short",
+                        "size": executed_size,
+                        "entry_price": executed_price or row["close"],
+                    }
+                    save_positions(key_positions)
+                    dl.log(f"✅ OPENED SHORT {executed_size} {param['pair']} at {executed_price or row['close']}")
+
+                    # 2️⃣ Place ATR-based stop-loss on Bitget
+                    atr_value = row["atr"] if "atr" in row else None
+                    if np.isfinite(atr_value):
+                        stop_loss_price = (executed_price or row["close"]) + atr_value
+                        trigger_price = exchange.price_to_precision(param["pair"], stop_loss_price)
+                        stop_side = "buy"
+
+                        sl_order = await exchange.place_trigger_order(
+                            pair=param["pair"],
+                            side=stop_side,
+                            trigger_price=trigger_price,
+                            price=None,
+                            size=order.size,
+                            type="market",
+                            reduce=True,
+                            margin_mode=margin_mode,
+                            hedge_mode=hedge_mode,
+                            error=True,
+                        )
+
+                        if sl_order:
+                            dl.log(f"🛑 Stop-loss placed for {param['pair']} at {stop_loss_price}")
+
+
+                        # verify triggers via helper
+                        open_triggers = await exchange.get_open_trigger_orders(param["pair"])
+                        if open_triggers:
+                            dl.log(f"🛑 Stop-loss placed for {param['pair']} at {trigger_price} (found {len(open_triggers)} trigger(s))")
+                        else:
+                            dl.log(f"⚠️ Stop-loss NOT visible for {param['pair']} after placement")
                 except Exception as e:
-                    await dl.send_now(f"❌ Error opening short on {param['pair']}: {e}", level="ERROR")
+                    await dl.send_now(f"❌ Error opening long on {param['pair']}: {e}", level="ERROR")
+
+
     except Exception as main_e:
         # top-level exception handler inside main
         print(f"❌ Error in main: {main_e}")

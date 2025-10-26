@@ -1,0 +1,14 @@
+{
+  "BTC/USDT": {
+    "pair": "BTC/USDT",
+    "side": "long",
+    "size": 0.0009,
+    "entry_price": 113730.2
+  },
+  "ETH/USDT": {
+    "pair": "ETH/USDT",
+    "side": "long",
+    "size": 0.02,
+    "entry_price": 4078.14
+  }
+}
